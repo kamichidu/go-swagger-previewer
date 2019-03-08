@@ -3,11 +3,16 @@ package main
 import (
 	"flag"
 	"fmt"
+	"gopkg.in/yaml.v2"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/mattn/go-colorable"
 	"github.com/mattn/go-isatty"
@@ -33,30 +38,109 @@ func cacheDir() string {
 
 func requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		log.Infof("%s", req.RequestURI)
+		log.Infof("%s %s %s", req.Method, req.RequestURI, req.Proto)
 		next.ServeHTTP(w, req)
 	})
 }
 
-func urlQueryParam(next http.Handler) http.Handler {
+func replaceContent(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if q := req.URL.Query(); q.Get("url") == "" {
-			log.Debugf("virtual host: %s", req.Host)
-			log.Debugf("request url: %s", req.URL)
-			u := *req.URL
-			if u.Scheme == "" {
-				u.Scheme = "http"
-			}
-			if u.Host == "" {
-				u.Host = req.Host
-			}
-			u.Path = "/swagger.yml"
-			q.Set("url", u.String())
-			req.URL.RawQuery = q.Encode()
-			http.Redirect(w, req, req.URL.String(), http.StatusFound)
-		} else {
-			next.ServeHTTP(w, req)
+		rec := httptest.NewRecorder()
+		next.ServeHTTP(rec, req)
+		body := rec.Body.String()
+		if strings.HasPrefix(http.DetectContentType([]byte(body)), "text/html") {
+			body = strings.Replace(
+				body,
+				`url: "http://petstore.swagger.io/v2/swagger.json",`,
+				``,
+				-1)
+			body = strings.Replace(
+				body,
+				`dom_id: '#swagger-ui',`,
+				strings.Join([]string{
+					`dom_id: '#swagger-ui',`,
+					`configUrl: '/.swagger-config.yaml',`,
+				}, "\n"),
+				-1)
 		}
+		for k, vals := range rec.HeaderMap {
+			if k == "Content-Length" {
+				continue
+			}
+			for _, v := range vals {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(rec.Code)
+		w.Write([]byte(body))
+	})
+}
+
+type fallbackFS struct {
+	Dirs []string
+}
+
+func (fs *fallbackFS) Open(name string) (http.File, error) {
+	for _, dir := range fs.Dirs {
+		f, err := os.Open(filepath.Join(dir, name))
+		if os.IsNotExist(err) {
+			continue
+		}
+		return f, nil
+	}
+	return nil, os.ErrNotExist
+}
+
+func noCache(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		next.ServeHTTP(w, req)
+	})
+}
+
+func swaggerConfig(dir string) http.Handler {
+	var urls []map[string]string
+	err := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if info.IsDir() {
+			return nil
+		}
+		switch filepath.Ext(info.Name()) {
+		case ".json", ".yml", ".yaml":
+			relname, err := filepath.Rel(dir, p)
+			if err != nil {
+				panic(err)
+			}
+			relname = path.Join("/", path.Clean(filepath.ToSlash(relname)))
+			urls = append(urls, map[string]string{
+				"name": relname,
+				"url":  relname,
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		panic(err)
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		cfg := map[string]interface{}{}
+		var def string
+		if referer, err := url.Parse(req.Referer()); err == nil {
+			def = referer.Query().Get("url")
+		}
+		if len(urls) > 0 {
+			if def != "" {
+				cfg["urls.primaryName"] = def
+			}
+			cfg["urls"] = urls
+		} else {
+			cfg["url"] = def
+		}
+		cfg["validatorUrl"] = "/validate"
+		content, err := yaml.Marshal(cfg)
+		if err != nil {
+			panic(err)
+		}
+		w.Write(content)
 	})
 }
 
@@ -79,7 +163,7 @@ func run(in io.Reader, out io.Writer, errOut io.Writer, args []string) int {
 	)
 	flag.CommandLine.SetOutput(errOut)
 	flag.Usage = func() {
-		fmt.Fprintln(errOut, "go-swagger-previewer [options] {path/to/swagger.yml}")
+		fmt.Fprintln(errOut, "go-swagger-previewer [options] {path/to/dir/contains-swagger.yml}")
 		fmt.Fprintln(errOut)
 		fmt.Fprintln(errOut, "available options:")
 		flag.PrintDefaults()
@@ -89,7 +173,8 @@ func run(in io.Reader, out io.Writer, errOut io.Writer, args []string) int {
 	flag.BoolVar(&update, "u", false, "update swagger-ui")
 	flag.Parse()
 
-	if filename := flag.Arg(0); filename == "" {
+	rootDir := flag.Arg(0)
+	if rootDir == "" {
 		flag.Usage()
 		return 128
 	}
@@ -113,11 +198,13 @@ func run(in io.Reader, out io.Writer, errOut io.Writer, args []string) int {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/", urlQueryParam(http.FileServer(http.Dir(swaggerUIDistDir))))
-	mux.HandleFunc("/swagger.yml", func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Set("Cache-Control", "no-cache")
-		http.ServeFile(w, req, flag.Arg(0))
-	})
+	mux.Handle("/", noCache(replaceContent(http.FileServer(&fallbackFS{
+		Dirs: []string{
+			swaggerUIDistDir,
+			rootDir,
+		},
+	}))))
+	mux.Handle("/.swagger-config.yaml", noCache(swaggerConfig(rootDir)))
 	mux.Handle("/validate", validate(flag.Arg(0)))
 
 	srv := &http.Server{

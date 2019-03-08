@@ -5,5 +5,5 @@ Available commands
 ------------------------------------------------------------------------------------------------------------------------
 
 ```
-go-swagger-previewer -p 8080 path/to/swagger.yml
+go-swagger-previewer -l :8080 path/to/dir
 ```
